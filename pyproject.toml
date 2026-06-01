@@ -1,0 +1,28 @@
+[project]
+name = "homkaml-homeworks"
+version = "0.1.0"
+description = "Reproducible environment for homework notebooks."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ipykernel>=6.29.5",
+    "jupyterlab>=4.4.0",
+    "matplotlib>=3.10.0",
+    "numpy>=2.2.0",
+    "pandas>=2.2.0",
+    "scikit-learn>=1.6.0",
+    "seaborn>=0.13.2",
+    "xlrd>=2.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
