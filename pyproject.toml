@@ -15,5 +15,14 @@ dependencies = [
     "xlrd>=2.0.1",
 ]
 
+[dependency-groups]
+dev = [
+    "ruff>=0.11.0",
+]
+
 [tool.uv]
 package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

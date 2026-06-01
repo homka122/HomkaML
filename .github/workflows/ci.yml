@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  checks:
+    name: Format, lint, and run notebook
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Check Python formatting
+        run: uv run ruff format --check 1HW/simple_kmeans.py
+
+      - name: Lint Python code
+        run: uv run ruff check 1HW/simple_kmeans.py
+
+      - name: Compile Python code
+        run: uv run python -m py_compile 1HW/simple_kmeans.py
+
+      - name: Execute homework notebook
+        run: |
+          uv run jupyter nbconvert \
+            --to notebook \
+            --execute 1HW/hw1_mice_protein_clustering.ipynb \
+            --output hw1_mice_protein_clustering.executed.ipynb \
+            --output-dir /tmp
