@@ -7,6 +7,19 @@ uv sync --frozen
 uv run jupyter lab 2HW/hw2_svhn_classification.ipynb
 ```
 
+Run regression tests:
+
+```bash
+uv run python -m unittest discover -s 2HW -p 'test_*.py' -v
+```
+
+Execute and save all notebook outputs:
+
+```bash
+OPENBLAS_NUM_THREADS=1 uv run jupyter nbconvert --execute --to notebook \
+  --ExecutePreprocessor.timeout=1800 --inplace 2HW/hw2_svhn_classification.ipynb
+```
+
 The notebook expects SVHN cropped files in `2HW/`:
 
 ```text

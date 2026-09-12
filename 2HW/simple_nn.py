@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from time import perf_counter
+
 import numpy as np
 
 
@@ -94,8 +97,8 @@ class CrossEntropyLoss:
         self.probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
         self.y = y
 
-        correct_probs = self.probs[np.arange(len(y)), y]
-        return -np.log(correct_probs + 1e-12).mean()
+        log_normalizer = np.log(exp_logits.sum(axis=1))
+        return (log_normalizer - shifted_logits[np.arange(len(y)), y]).mean()
 
     def backward(self):
         grad = self.probs.copy()
@@ -107,10 +110,13 @@ class Sequential:
     def __init__(self, layers):
         self.layers = layers
 
-    def forward(self, X, training=True):
+    def forward(self, X, training=True, update_running=True):
         output = X
         for layer in self.layers:
-            output = layer.forward(output, training=training)
+            if isinstance(layer, BatchNormLayer):
+                output = layer.forward(output, training=training, update_running=update_running)
+            else:
+                output = layer.forward(output, training=training)
         return output
 
     def backward(self, grad_output):
@@ -140,6 +146,27 @@ class Sequential:
 
     def predict(self, X):
         return self.forward(X, training=False).argmax(axis=1)
+
+    def _state_arrays(self):
+        arrays = {name: param for name, param, _ in self.parameters()}
+        for layer_id, layer in enumerate(self.layers):
+            if isinstance(layer, BatchNormLayer):
+                arrays[f"layer{layer_id}.running_mean"] = layer.running_mean
+                arrays[f"layer{layer_id}.running_var"] = layer.running_var
+        return arrays
+
+    def state_dict(self):
+        return {name: value.copy() for name, value in self._state_arrays().items()}
+
+    def load_state_dict(self, state):
+        arrays = self._state_arrays()
+        if arrays.keys() != state.keys():
+            raise ValueError("State does not match the model parameters")
+        for name, value in arrays.items():
+            if value.shape != state[name].shape:
+                raise ValueError(f"Invalid shape for {name}")
+        for name, value in arrays.items():
+            value[...] = state[name]
 
 
 class SGD:
@@ -208,14 +235,53 @@ def minibatches(X, y, batch_size, rng, shuffle=True):
         yield X[batch_ids], y[batch_ids]
 
 
-def train_epoch(model, loss_fn, optimizer, X, y, batch_size=128, l2=0.0, rng=None):
+def train_epoch(
+    model,
+    loss_fn,
+    optimizer,
+    X,
+    y,
+    batch_size=128,
+    l2=0.0,
+    rng=None,
+    gradient_checks=0,
+    gradient_batch_size=8,
+    gradient_rtol=1e-3,
+    gradient_atol=1e-5,
+):
     rng = np.random.default_rng(rng)
     total_loss = 0.0
     total_correct = 0
+    checked_steps = 0
+    checked_gradients = 0
+    max_gradient_error = 0.0
 
     for X_batch, y_batch in minibatches(X, y, batch_size, rng, shuffle=True):
+        if gradient_checks:
+            checks = gradient_check_model(
+                model,
+                loss_fn,
+                X_batch[:gradient_batch_size],
+                y_batch[:gradient_batch_size],
+                l2=l2,
+                eps=1e-6,
+                num_checks=gradient_checks,
+                random_state=rng,
+            )
+            for check in checks:
+                analytic, numeric = check["analytic"], check["numeric"]
+                tolerance = gradient_atol + gradient_rtol * max(abs(analytic), abs(numeric))
+                error = abs(analytic - numeric) / tolerance
+                if not np.isfinite(error) or error > 1:
+                    raise AssertionError(f"Gradient check failed: {check}")
+                max_gradient_error = max(max_gradient_error, error)
+            checked_steps += 1
+            checked_gradients += len(checks)
+
         logits = model.forward(X_batch, training=True)
         loss = loss_fn.forward(logits, y_batch) + model.l2_loss(l2)
+        if not np.isfinite(loss):
+            raise FloatingPointError("Non-finite training loss")
         grad_logits = loss_fn.backward()
         model.backward(grad_logits)
         model.add_l2_gradients(l2)
@@ -227,6 +293,9 @@ def train_epoch(model, loss_fn, optimizer, X, y, batch_size=128, l2=0.0, rng=Non
     return {
         "loss": total_loss / len(X),
         "accuracy": total_correct / len(X),
+        "gradient_steps": checked_steps,
+        "gradient_checks": checked_gradients,
+        "gradient_max_error": max_gradient_error,
     }
 
 
@@ -247,41 +316,119 @@ def evaluate(model, loss_fn, X, y, batch_size=512, l2=0.0):
     }
 
 
+def fit(
+    model,
+    optimizer,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    epochs=20,
+    batch_size=128,
+    l2=0.0,
+    random_state=42,
+    gradient_checks=2,
+):
+    """Train and restore the epoch with best validation accuracy, then lowest loss."""
+    if epochs < 1:
+        raise ValueError("epochs must be positive")
+    loss_fn = CrossEntropyLoss()
+    history = []
+    best_score = (-np.inf, -np.inf)
+    started_at = perf_counter()
+
+    for epoch in range(1, epochs + 1):
+        step_metrics = train_epoch(
+            model,
+            loss_fn,
+            optimizer,
+            X_train,
+            y_train,
+            batch_size=batch_size,
+            l2=l2,
+            rng=random_state + epoch,
+            gradient_checks=gradient_checks,
+        )
+        train_metrics = evaluate(model, loss_fn, X_train, y_train, batch_size, l2)
+        val_metrics = evaluate(model, loss_fn, X_val, y_val, batch_size, l2)
+        if not np.isfinite(train_metrics["loss"]) or not np.isfinite(val_metrics["loss"]):
+            raise FloatingPointError("Non-finite evaluation loss")
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_accuracy": train_metrics["accuracy"],
+                "val_loss": val_metrics["loss"],
+                "val_accuracy": val_metrics["accuracy"],
+                "gradient_steps": step_metrics["gradient_steps"],
+                "gradient_checks": step_metrics["gradient_checks"],
+                "gradient_max_error": step_metrics["gradient_max_error"],
+                "elapsed_sec": perf_counter() - started_at,
+            }
+        )
+        score = (val_metrics["accuracy"], -val_metrics["loss"])
+        if score > best_score:
+            best_score = score
+            best_state = model.state_dict()
+
+    model.load_state_dict(best_state)
+    return history
+
+
 def relative_error(analytic, numeric):
     denominator = np.maximum(1e-8, np.abs(analytic) + np.abs(numeric))
     return np.max(np.abs(analytic - numeric) / denominator)
 
 
+@contextmanager
+def _preserve_state(*objects):
+    # Forward/backward replace caches and gradients; retain their original references.
+    states = [obj.__dict__.copy() for obj in objects]
+    try:
+        yield
+    finally:
+        for obj, state in zip(objects, states):
+            obj.__dict__.clear()
+            obj.__dict__.update(state)
+
+
+def _numeric_gradient(objective, parameter, index, eps):
+    old_value = parameter[index]
+    try:
+        parameter[index] = old_value + eps
+        plus = objective()
+        parameter[index] = old_value - eps
+        minus = objective()
+    finally:
+        parameter[index] = old_value
+    return (plus - minus) / (2 * eps)
+
+
 def gradient_check_model(model, loss_fn, X, y, l2=0.0, eps=1e-5, num_checks=10, random_state=42):
     rng = np.random.default_rng(random_state)
-    logits = model.forward(X, training=True)
-    loss_fn.forward(logits, y)
-    model.backward(loss_fn.backward())
-    model.add_l2_gradients(l2)
 
-    results = []
-    for name, param, grad in model.parameters():
-        for _ in range(num_checks):
-            index = tuple(rng.integers(0, size) for size in param.shape)
-            old_value = param[index]
+    def objective():
+        logits = model.forward(X, training=True, update_running=False)
+        return loss_fn.forward(logits, y) + model.l2_loss(l2)
 
-            param[index] = old_value + eps
-            plus = loss_fn.forward(model.forward(X, training=True), y) + model.l2_loss(l2)
-
-            param[index] = old_value - eps
-            minus = loss_fn.forward(model.forward(X, training=True), y) + model.l2_loss(l2)
-
-            param[index] = old_value
-            numeric_grad = (plus - minus) / (2 * eps)
-            results.append(
-                {
-                    "parameter": name,
-                    "index": index,
-                    "analytic": grad[index],
-                    "numeric": numeric_grad,
-                    "relative_error": relative_error(grad[index], numeric_grad),
-                }
-            )
+    with _preserve_state(*model.layers, loss_fn):
+        objective()
+        model.backward(loss_fn.backward())
+        model.add_l2_gradients(l2)
+        results = []
+        for name, param, grad in model.parameters():
+            for _ in range(num_checks):
+                index = tuple(rng.integers(0, size) for size in param.shape)
+                numeric_grad = _numeric_gradient(objective, param, index, eps)
+                results.append(
+                    {
+                        "parameter": name,
+                        "index": index,
+                        "analytic": grad[index],
+                        "numeric": numeric_grad,
+                        "relative_error": relative_error(grad[index], numeric_grad),
+                    }
+                )
 
     return results
 
